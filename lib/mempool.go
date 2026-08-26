@@ -13,6 +13,11 @@ import (
 
 var _ Mempool = &FeeMempool{} // Mempool interface enforcement for FeeMempool implementation
 
+const (
+	failedTxCacheMaxEntries = 5000
+	failedTxCacheMaxTxBytes = 4 * 1024
+)
+
 // Mempool interface is a model for a pre-block, in-memory, Transaction store
 type Mempool interface {
 	Contains(txHash string) bool                             // whether the mempool has this transaction already (de-duplicated by hash)
@@ -61,13 +66,7 @@ func (f *FeeMempool) AddTransactions(txs ...[]byte) (recheck bool, err ErrorI) {
 	batchTxs := make(map[string]struct{}, len(txs))
 	txsBytes := 0
 	for _, tx := range txs {
-		// ensure the size of the Transaction doesn't exceed the individual limit
 		txBytes := len(tx)
-		// if the transaction bytes is larger than the max size
-		if uint32(txBytes) > f.config.IndividualMaxTxSize {
-			// exit with error
-			return false, ErrMaxTxSize()
-		}
 		// check if the mempool already contains the transaction
 		hash := crypto.HashString(tx)
 		if _, found := f.pool.m[hash]; found {
@@ -86,6 +85,10 @@ func (f *FeeMempool) AddTransactions(txs ...[]byte) (recheck bool, err ErrorI) {
 		// perform basic validations against the tx object
 		if err = transaction.CheckBasic(); err != nil {
 			return false, err
+		}
+		// certificate results may contain a full DEX batch and remain bounded by MaxTotalBytes
+		if uint32(txBytes) > f.config.IndividualMaxTxSize && transaction.MessageType != "certificateResults" {
+			return false, ErrMaxTxSize()
 		}
 		// extract the fee from the transaction result
 		fee := transaction.Fee
@@ -378,6 +381,15 @@ func (f *FailedTxCache) Add(failed *FailedTx) (added bool) {
 	f.l.Lock()
 	// unlock when the function completes
 	defer f.l.Unlock()
+	if failed == nil || len(failed.bytes) > failedTxCacheMaxTxBytes {
+		return false
+	}
+	if _, exists := f.cache[failed.Hash]; !exists && len(f.cache) >= failedTxCacheMaxEntries {
+		for hash := range f.cache {
+			delete(f.cache, hash)
+			break
+		}
+	}
 	// add a new 'failed tx' type to the cache
 	f.cache[failed.Hash] = failed
 	// exit with 'added'
@@ -402,6 +414,7 @@ func (f *FailedTxCache) Get(txHash string) (failedTx *FailedTx, found bool) {
 }
 
 // GetFailedForAddress() returns all the failed transactions in the cache for a given address
+// if address is empty, all failed transactions in the cache are returned
 func (f *FailedTxCache) GetFailedForAddress(address string) (failedTxs []*FailedTx) {
 	// lock for thread safety
 	f.l.Lock()
@@ -409,8 +422,8 @@ func (f *FailedTxCache) GetFailedForAddress(address string) (failedTxs []*Failed
 	defer f.l.Unlock()
 	// for each failed transaction in the cache
 	for _, failed := range f.cache {
-		// if the address matches
-		if failed.Address == address {
+		// if no address was specified or the address matches
+		if address == "" || failed.Address == address {
 			// add to the list
 			failedTxs = append(failedTxs, failed)
 		}
